@@ -1,19 +1,32 @@
 /*
- * Copyright 2009 The Android Open Source Project
+ * Copyright 2012 The Android Open Source Project
  *
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
 
 
-#include "SkBlitRow.h"
 #include "SkBlitMask.h"
+#include "SkBlitRow.h"
 #include "SkColorPriv.h"
 #include "SkDither.h"
+#include "SkUtils.h"
+
+#include "SkCachePreload_arm.h"
 
 #if defined(__ARM_HAVE_NEON)
 #include <arm_neon.h>
 #endif
+
+extern "C"  void S32A_Opaque_BlitRow32_arm(SkPMColor* SK_RESTRICT dst,
+                                            const SkPMColor* SK_RESTRICT src,
+                                            int count,
+                                            U8CPU alpha);
+
+extern "C"  void S32A_Blend_BlitRow32_arm_neon(SkPMColor* SK_RESTRICT dst,
+                                          const SkPMColor* SK_RESTRICT src,
+                                          int count,
+                                          U8CPU alpha);
 
 #if defined(__ARM_HAVE_NEON) && defined(SK_CPU_LENDIAN)
 static void S32A_D565_Opaque_neon(uint16_t* SK_RESTRICT dst,
@@ -29,6 +42,10 @@ static void S32A_D565_Opaque_neon(uint16_t* SK_RESTRICT dst,
                       "vmov.u8    d31, #1<<7                  \n\t"
                       "vld1.16    {q12}, [%[dst]]             \n\t"
                       "vld4.8     {d0-d3}, [%[src]]           \n\t"
+                      // Thumb does not support the standard ARM conditional
+                      // instructions but instead requires the 'it' instruction
+                      // to signal conditional execution
+                      "it eq                                  \n\t"
                       "moveq      ip, #8                      \n\t"
                       "mov        %[keep_dst], %[dst]         \n\t"
                       
@@ -470,14 +487,18 @@ static void S32A_D565_Opaque_v7(uint16_t* SK_RESTRICT dst,
                   : "memory", "cc", "r3", "r4", "r5", "r6", "r7", "ip"
                   );
 }
-#define S32A_D565_Opaque_PROC       S32A_D565_Opaque_v7
 #define S32A_D565_Blend_PROC        NULL
 #define S32_D565_Blend_Dither_PROC  NULL
 #else
-#define S32A_D565_Opaque_PROC       NULL
 #define S32A_D565_Blend_PROC        NULL
 #define S32_D565_Blend_Dither_PROC  NULL
 #endif
+
+/*
+ * Use neon version of BLIT assembly code from S32A_D565_Opaque_arm.S, where we process
+ * 16 pixels at-a-time and also optimize for alpha=255 case.
+ */
+#define S32A_D565_Opaque_PROC       NULL
 
 /* Don't have a special version that assumes each src is opaque, but our S32A
     is still faster than the default, so use it here
@@ -663,6 +684,10 @@ TAIL:
 
 #elif defined(__ARM_HAVE_NEON) && defined(SK_CPU_LENDIAN)
 
+/*
+ * User S32A_Opaque_BlitRow32 function from S32A_Opaque_BlitRow32.S
+ */
+#if 0
 static void S32A_Opaque_BlitRow32_neon(SkPMColor* SK_RESTRICT dst,
                                   const SkPMColor* SK_RESTRICT src,
                                   int count, U8CPU alpha) {
@@ -786,6 +811,13 @@ static void S32A_Opaque_BlitRow32_neon(SkPMColor* SK_RESTRICT dst,
 }
 
 #define	S32A_Opaque_BlitRow32_PROC	S32A_Opaque_BlitRow32_neon
+#endif
+
+/*
+ * Use asm version of BlitRow function. Neon instructions are
+ * used for armv7 targets.
+ */
+#define S32A_Opaque_BlitRow32_PROC  S32A_Opaque_BlitRow32_arm
 
 #elif defined (__ARM_ARCH__) /* #if defined(__ARM_HAVE_NEON) && defined... */
 
@@ -1799,6 +1831,105 @@ static void S32_D565_Opaque_Dither_neon(uint16_t* SK_RESTRICT dst,
 #define	S32_D565_Opaque_Dither_PROC NULL
 #endif
 
+#if defined(__ARM_HAVE_NEON) && defined(SK_CPU_LENDIAN)
+static void Color32_neon(SkPMColor* dst, const SkPMColor* src, int count,
+                         SkPMColor color) {
+    if (count <= 0) {
+        return;
+    }
+
+    if (0 == color) {
+        if (src != dst) {
+            memcpy(dst, src, count * sizeof(SkPMColor));
+        }
+        return;
+    }
+
+    unsigned colorA = SkGetPackedA32(color);
+    if (255 == colorA) {
+        sk_memset32(dst, color, count);
+    } else {
+        unsigned scale = 256 - SkAlpha255To256(colorA);
+
+        if (count >= 8) {
+            // at the end of this assembly, count will have been decremented
+            // to a negative value. That is, if count mod 8 = x, it will be
+            // -8 +x coming out.
+            asm volatile (
+                PLD128(src, 0)
+
+                "vdup.32    q0, %[color]                \n\t"
+
+                PLD128(src, 128)
+
+                // scale numerical interval [0-255], so load as 8 bits
+                "vdup.8     d2, %[scale]                \n\t"
+
+                PLD128(src, 256)
+
+                "subs       %[count], %[count], #8      \n\t"
+
+                PLD128(src, 384)
+
+                "Loop_Color32:                          \n\t"
+
+                // load src color, 8 pixels, 4 64 bit registers
+                // (and increment src).
+                "vld1.32    {d4-d7}, [%[src]]!          \n\t"
+
+                PLD128(src, 384)
+
+                // multiply long by scale, 64 bits at a time,
+                // destination into a 128 bit register.
+                "vmull.u8   q4, d4, d2                  \n\t"
+                "vmull.u8   q5, d5, d2                  \n\t"
+                "vmull.u8   q6, d6, d2                  \n\t"
+                "vmull.u8   q7, d7, d2                  \n\t"
+
+                // shift the 128 bit registers, containing the 16
+                // bit scaled values back to 8 bits, narrowing the
+                // results to 64 bit registers.
+                "vshrn.i16  d8, q4, #8                  \n\t"
+                "vshrn.i16  d9, q5, #8                  \n\t"
+                "vshrn.i16  d10, q6, #8                 \n\t"
+                "vshrn.i16  d11, q7, #8                 \n\t"
+
+                // adding back the color, using 128 bit registers.
+                "vadd.i8    q6, q4, q0                  \n\t"
+                "vadd.i8    q7, q5, q0                  \n\t"
+
+                // store back the 8 calculated pixels (2 128 bit
+                // registers), and increment dst.
+                "vst1.32    {d12-d15}, [%[dst]]!        \n\t"
+
+                "subs       %[count], %[count], #8      \n\t"
+                "bge        Loop_Color32                \n\t"
+                : [src] "+r" (src), [dst] "+r" (dst), [count] "+r" (count)
+                : [color] "r" (color), [scale] "r" (scale)
+                : "cc", "memory",
+                  "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
+                  "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15"
+                          );
+            // At this point, if we went through the inline assembly, count is
+            // a negative value:
+            // if the value is -8, there is no pixel left to process.
+            // if the value is -7, there is one pixel left to process
+            // ...
+            // And'ing it with 7 will give us the number of pixels
+            // left to process.
+            count = count & 0x7;
+        }
+
+        while (count > 0) {
+            *dst = color + SkAlphaMulQ(*src, scale);
+            src += 1;
+            dst += 1;
+            count--;
+        }
+    }
+}
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 
 static const SkBlitRow::Proc platform_565_procs[] = {
@@ -1848,11 +1979,14 @@ SkBlitRow::Proc32 SkBlitRow::PlatformProcs32(unsigned flags) {
     return platform_32_procs[flags];
 }
 
-SkBlitRow::ColorProc SkBlitRow::PlatformColorProc() {
-    return NULL;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
+SkBlitRow::ColorProc SkBlitRow::PlatformColorProc() {
+#if defined(__ARM_HAVE_NEON) && defined(SK_CPU_LENDIAN)
+    return Color32_neon;
+#else
+    return NULL;
+#endif
+}
 
 SkBlitMask::ColorProc SkBlitMask::PlatformColorProcs(SkBitmap::Config dstConfig,
                                                      SkMask::Format maskFormat,
